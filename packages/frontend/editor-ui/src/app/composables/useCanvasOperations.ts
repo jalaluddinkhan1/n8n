@@ -271,6 +271,7 @@ export function useCanvasOperations() {
 
 	const i18n = useI18n();
 	const toast = useToast();
+	const { warnAboutRestrictedNodes } = useRestrictedNodeWarning();
 	const workflowHelpers = useWorkflowHelpers();
 	const nodeHelpers = useNodeHelpers();
 	const aiSimulatedDataGuard = useAiSimulatedDataGuard();
@@ -1277,6 +1278,9 @@ export function useCanvasOperations() {
 		if (!options.keepPristine) {
 			uiStore.markStateDirty();
 		}
+
+		// Paste, import, templates and the AI builder all add nodes here, so one check covers them.
+		warnAboutRestrictedNodes(addedNodes.map((node) => node.type));
 
 		return addedNodes;
 	}
