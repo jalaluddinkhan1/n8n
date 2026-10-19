@@ -1,10 +1,20 @@
 import { ScimConfigPatchDto, type ScimConfigResponse } from '@n8n/api-types';
 import { Logger, ModuleRegistry } from '@n8n/backend-common';
 import type { AuthenticatedRequest } from '@n8n/db';
-import { Body, Delete, Get, GlobalScope, Patch, Post, RestController } from '@n8n/decorators';
-import type { Response } from 'express';
+import {
+	Body,
+	Delete,
+	Get,
+	GlobalScope,
+	Middleware,
+	Patch,
+	Post,
+	RestController,
+} from '@n8n/decorators';
+import type { NextFunction, Request, Response } from 'express';
 
 import { deriveScimConnectionStatus, ScimConnectionService } from './scim-connection.service';
+import { ScimOptInService } from './scim-opt-in.service';
 import { ScimSettingsService } from './scim-settings.service';
 import { ScimSsoService } from './scim-sso.service';
 import { ScimTokenService } from './scim-token.service';
@@ -29,10 +39,21 @@ export class ScimTokenController {
 		private readonly scimTokenService: ScimTokenService,
 		private readonly scimSettingsService: ScimSettingsService,
 		private readonly moduleRegistry: ModuleRegistry,
+		private readonly scimOptInService: ScimOptInService,
 		private readonly scimConnectionService: ScimConnectionService,
 		private readonly scimSsoService: ScimSsoService,
 		private readonly scimService: ScimService,
 	) {}
+
+	/**
+	 * Every route answers 404 while the SCIM opt-in is off. Controller
+	 * middlewares run after authentication and the scope check, so a caller
+	 * without `scim:manage` still gets 403.
+	 */
+	@Middleware()
+	async requireOptIn(req: Request, res: Response, next: NextFunction) {
+		await this.scimOptInService.gate(req, res, next);
+	}
 
 	/**
 	 * GET /rest/scim/config
