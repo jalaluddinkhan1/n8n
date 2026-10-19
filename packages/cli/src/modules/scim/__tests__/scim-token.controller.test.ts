@@ -1,3 +1,4 @@
+import type { ScimDeprovisioningPolicy } from '@n8n/api-types';
 import type { Logger, ModuleRegistry } from '@n8n/backend-common';
 import type { AuthenticatedRequest, User } from '@n8n/db';
 import { ControllerRegistryMetadata } from '@n8n/decorators';
@@ -58,7 +59,6 @@ describe('ScimTokenController', () => {
 			dataAction: 'transfer',
 			transferTarget: null,
 		});
-		scimDeprovisioningService.updatePolicy.mockResolvedValue({ ...defaultPolicy });
 		controller = new ScimTokenController(
 			mock<Logger>(),
 			scimTokenService,
@@ -254,10 +254,14 @@ describe('ScimTokenController', () => {
 
 	describe('PATCH /config', () => {
 		/** The switch before the request, as the settings service reads it in its transaction. */
-		const savedSettings = (wasEnabled: boolean) =>
+		const savedSettings = (
+			wasEnabled: boolean,
+			policy: ScimDeprovisioningPolicy = { ...defaultPolicy },
+		) =>
 			scimSettingsService.update.mockImplementation(async ({ enabled }) => ({
 				wasEnabled,
-				enabled,
+				enabled: enabled ?? wasEnabled,
+				policy,
 			}));
 
 		beforeEach(() => {
@@ -271,6 +275,7 @@ describe('ScimTokenController', () => {
 
 			expect(scimSettingsService.update).toHaveBeenCalledExactlyOnceWith({
 				enabled,
+				policy: { onDelete: undefined, dataAction: undefined, transferProjectId: undefined },
 				assertCanEnable: expect.any(Function),
 			});
 			// Without this the settings snapshot keeps serving the previous value.
@@ -279,27 +284,53 @@ describe('ScimTokenController', () => {
 			expect(res.json).toHaveBeenCalledWith({ data: { enabled, ...defaultPolicy } });
 		});
 
+		it('saves the switch and the policy in one update', async () => {
+			const policy = { onDelete: 'delete', dataAction: 'delete', transferProjectId: null } as const;
+			savedSettings(false, policy);
+			const res = makeRes();
+
+			await controller.updateConfig(req, res, {
+				enabled: true,
+				onDelete: 'delete',
+				dataAction: 'delete',
+			});
+
+			expect(scimSettingsService.update).toHaveBeenCalledExactlyOnceWith({
+				enabled: true,
+				policy: { onDelete: 'delete', dataAction: 'delete', transferProjectId: undefined },
+				assertCanEnable: expect.any(Function),
+			});
+			expect(res.json).toHaveBeenCalledWith({ data: { enabled: true, ...policy } });
+		});
+
 		it('changes only the policy and keeps enabled when the body has no enabled', async () => {
 			const policy = { ...defaultPolicy, onDelete: 'delete' } as const;
-			scimDeprovisioningService.updatePolicy.mockResolvedValue(policy);
-			scimSettingsService.isEnabled.mockResolvedValue(true);
+			savedSettings(true, policy);
 			const res = makeRes();
 
 			await controller.updateConfig(req, res, { onDelete: 'delete' });
 
-			expect(scimDeprovisioningService.updatePolicy).toHaveBeenCalledWith({
-				onDelete: 'delete',
-				dataAction: undefined,
-				transferProjectId: undefined,
+			expect(scimSettingsService.update).toHaveBeenCalledWith({
+				enabled: undefined,
+				policy: { onDelete: 'delete', dataAction: undefined, transferProjectId: undefined },
+				assertCanEnable: expect.any(Function),
 			});
-			expect(scimSettingsService.update).not.toHaveBeenCalled();
 			expect(moduleRegistry.refreshModuleSettings).not.toHaveBeenCalled();
 			expect(res.status).toHaveBeenCalledWith(200);
 			expect(res.json).toHaveBeenCalledWith({ data: { enabled: true, ...policy } });
 		});
 
-		it('returns 400 and keeps SCIM unchanged when the transfer target is not valid', async () => {
-			scimDeprovisioningService.updatePolicy.mockRejectedValue(
+		it('checks the transfer target before it saves', async () => {
+			await controller.updateConfig(req, makeRes(), { transferProjectId: 'team-1' });
+
+			expect(scimDeprovisioningService.assertValidTransferTarget).toHaveBeenCalledWith('team-1');
+			expect(
+				scimDeprovisioningService.assertValidTransferTarget.mock.invocationCallOrder[0],
+			).toBeLessThan(scimSettingsService.update.mock.invocationCallOrder[0]);
+		});
+
+		it('returns 400 and saves nothing when the transfer target is not valid', async () => {
+			scimDeprovisioningService.assertValidTransferTarget.mockRejectedValue(
 				new ScimInvalidTransferTargetError('The transfer project missing does not exist.'),
 			);
 			const res = makeRes();
@@ -311,6 +342,27 @@ describe('ScimTokenController', () => {
 				message: 'The transfer project missing does not exist.',
 			});
 			expect(scimSettingsService.update).not.toHaveBeenCalled();
+		});
+
+		// The change is saved, so only the settings snapshot is late.
+		it('returns 200 when the settings refresh fails after the save', async () => {
+			moduleRegistry.refreshModuleSettings.mockRejectedValue(new Error('PostHog down'));
+			const res = makeRes();
+
+			await controller.updateConfig(req, res, { enabled: false });
+
+			expect(res.status).toHaveBeenCalledWith(200);
+			expect(res.json).toHaveBeenCalledWith({ data: { enabled: false, ...defaultPolicy } });
+		});
+
+		it('returns 500 when the save fails', async () => {
+			scimSettingsService.update.mockRejectedValue(new Error('db down'));
+			const res = makeRes();
+
+			await controller.updateConfig(req, res, { enabled: false, onDelete: 'delete' });
+
+			expect(res.status).toHaveBeenCalledWith(500);
+			expect(moduleRegistry.refreshModuleSettings).not.toHaveBeenCalled();
 		});
 
 		it('returns 400 and keeps SCIM off when single sign-on is off', async () => {
@@ -335,7 +387,7 @@ describe('ScimTokenController', () => {
 			scimSettingsService.update.mockImplementation(async ({ assertCanEnable }) => {
 				scimSsoService.isSsoEnabledInTransaction.mockResolvedValue(false);
 				await assertCanEnable?.(ctx);
-				return { wasEnabled: false, enabled: true };
+				return { wasEnabled: false, enabled: true, policy: { ...defaultPolicy } };
 			});
 			const res = makeRes();
 
