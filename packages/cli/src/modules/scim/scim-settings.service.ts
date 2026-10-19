@@ -1,4 +1,9 @@
-import { scimAuthFailureSchema, type ScimAuthFailure } from '@n8n/api-types';
+import {
+	scimAuthFailureSchema,
+	scimDeprovisioningPolicySchema,
+	type ScimAuthFailure,
+	type ScimDeprovisioningPolicy,
+} from '@n8n/api-types';
 import { SettingsRepository, TransactionRunner, type OperationContext } from '@n8n/db';
 import { Service } from '@n8n/di';
 import { jsonParse } from 'n8n-workflow';
@@ -10,6 +15,19 @@ import { SCIM_PROVISIONING_ENABLED_KEY } from '@/sso.ee/scim-switch-reader';
 
 const ENABLED_KEY = SCIM_PROVISIONING_ENABLED_KEY;
 const LAST_AUTH_FAILURE_KEY = 'scim.provisioning.lastAuthFailure';
+const DEPROVISIONING_POLICY_KEY = 'scim.provisioning.deprovisioningPolicy';
+
+/**
+ * The policy while none is stored. `disable` keeps the work of the user and
+ * keeps the behaviour of instances that never saved a policy. Without a
+ * transfer project, a deletion sends the work to the personal project of the
+ * owner.
+ */
+export const DEFAULT_SCIM_DEPROVISIONING_POLICY: Readonly<ScimDeprovisioningPolicy> = {
+	onDelete: 'disable',
+	dataAction: 'transfer',
+	transferProjectId: null,
+};
 
 /** A reset keeps only its time in the failure row. */
 const authFailureResetSchema = z.object({ resetAt: z.string().datetime() });
@@ -125,6 +143,27 @@ export class ScimSettingsService {
 			const value = JSON.stringify({ resetAt: new Date().toISOString() });
 			await this.settingsRepository.upsertByKey(LAST_AUTH_FAILURE_KEY, value, false, ctx);
 		});
+	}
+
+	/** What SCIM DELETE does. The default applies while no policy is stored. */
+	async getDeprovisioningPolicy(): Promise<ScimDeprovisioningPolicy> {
+		const row = await this.settingsRepository.findByKey(DEPROVISIONING_POLICY_KEY);
+		if (!row) return { ...DEFAULT_SCIM_DEPROVISIONING_POLICY };
+
+		// A value that does not parse falls back to the default, which keeps
+		// the work of the user.
+		const parsed = scimDeprovisioningPolicySchema.safeParse(
+			jsonParse<unknown>(row.value, { fallbackValue: null }),
+		);
+		return parsed.success ? parsed.data : { ...DEFAULT_SCIM_DEPROVISIONING_POLICY };
+	}
+
+	/** All fields of the policy are in one row, so that a save never stores a part of them. */
+	async setDeprovisioningPolicy(policy: ScimDeprovisioningPolicy): Promise<void> {
+		await this.settingsRepository.upsert(
+			{ key: DEPROVISIONING_POLICY_KEY, value: JSON.stringify(policy), loadOnStartup: false },
+			['key'],
+		);
 	}
 
 	/**

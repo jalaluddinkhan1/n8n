@@ -1,4 +1,8 @@
-import { ScimConfigPatchDto, type ScimConfigResponse } from '@n8n/api-types';
+import {
+	ScimConfigPatchDto,
+	type ScimConfigPatchResponse,
+	type ScimConfigResponse,
+} from '@n8n/api-types';
 import { Logger, ModuleRegistry } from '@n8n/backend-common';
 import type { AuthenticatedRequest } from '@n8n/db';
 import {
@@ -14,11 +18,16 @@ import {
 import type { NextFunction, Request, Response } from 'express';
 
 import { deriveScimConnectionStatus, ScimConnectionService } from './scim-connection.service';
+import { ScimDeprovisioningService } from './scim-deprovisioning.service';
 import { ScimOptInService } from './scim-opt-in.service';
 import { ScimSettingsService } from './scim-settings.service';
 import { ScimSsoService } from './scim-sso.service';
 import { ScimTokenService } from './scim-token.service';
-import { ScimSsoRequiredError, ScimTokenConflictError } from './scim.errors';
+import {
+	ScimInvalidTransferTargetError,
+	ScimSsoRequiredError,
+	ScimTokenConflictError,
+} from './scim.errors';
 import { ScimService } from './scim.service';
 
 /**
@@ -43,6 +52,7 @@ export class ScimTokenController {
 		private readonly scimConnectionService: ScimConnectionService,
 		private readonly scimSsoService: ScimSsoService,
 		private readonly scimService: ScimService,
+		private readonly scimDeprovisioningService: ScimDeprovisioningService,
 	) {}
 
 	/**
@@ -57,18 +67,19 @@ export class ScimTokenController {
 
 	/**
 	 * GET /rest/scim/config
-	 * Current provisioning state, connection status and the number of
-	 * provisioned users for the settings screen.
+	 * Current provisioning state, connection status, the number of
+	 * provisioned users and the deprovisioning policy for the settings screen.
 	 */
 	@Get('/config')
 	@GlobalScope('scim:manage')
 	async getConfig(_req: AuthenticatedRequest, res: Response) {
 		try {
-			const [enabled, tokenInfo, lastAuthFailure, counts] = await Promise.all([
+			const [enabled, tokenInfo, lastAuthFailure, counts, deprovisioning] = await Promise.all([
 				this.scimSettingsService.isEnabled(),
 				this.scimTokenService.getTokenInfo(),
 				this.scimSettingsService.getLastAuthFailure(),
 				this.scimService.getProvisioningCounts(),
+				this.scimDeprovisioningService.describePolicy(),
 			]);
 
 			return res.status(200).json({
@@ -82,6 +93,7 @@ export class ScimTokenController {
 					status: deriveScimConnectionStatus(tokenInfo.details, lastAuthFailure),
 					provisionedCount: counts.provisioned,
 					deactivatedCount: counts.deactivated,
+					...deprovisioning,
 				} satisfies ScimConfigResponse,
 			});
 		} catch (error) {
@@ -92,42 +104,43 @@ export class ScimTokenController {
 
 	/**
 	 * PATCH /rest/scim/config
-	 * Enable or disable SCIM provisioning. The stored token is kept when
-	 * provisioning is turned off. Enabling needs SAML or OIDC single sign-on,
-	 * because SCIM users can sign in only through the identity provider.
-	 * Disabling is always allowed.
+	 * Change one or more SCIM settings. A field that the body does not send
+	 * keeps its stored value.
+	 *
+	 * The stored token is kept when provisioning is turned off. Enabling needs
+	 * SAML or OIDC single sign-on, because SCIM users can sign in only through
+	 * the identity provider. Disabling is always allowed.
+	 *
+	 * A transfer project must be a team project or the personal project of an
+	 * active user. The checks run before anything is saved, so a rejected
+	 * body changes nothing.
 	 */
 	@Patch('/config')
 	@GlobalScope('scim:manage')
 	async updateConfig(_req: AuthenticatedRequest, res: Response, @Body body: ScimConfigPatchDto) {
-		const { enabled } = body;
+		const { enabled, onDelete, dataAction, transferProjectId } = body;
 
 		try {
 			if (enabled) this.assertSsoEnabled();
 
-			const saved = await this.scimSettingsService.update({
-				enabled,
-				// Single sign-on can turn off after the check above, also on another
-				// main. The SSO-off cascade takes the lock that this check runs
-				// under, and this check reads the saved method. Thus this check
-				// sees single sign-on off, or the cascade sees this enable.
-				assertCanEnable: async (ctx) => {
-					if (!(await this.scimSsoService.isSsoEnabledInTransaction(ctx))) {
-						throw new ScimSsoRequiredError();
-					}
-				},
+			const policy = await this.scimDeprovisioningService.updatePolicy({
+				onDelete,
+				dataAction,
+				transferProjectId,
 			});
+			if (enabled !== undefined) await this.setEnabled(enabled);
 
-			// A failure that is stored when SCIM turns on is from before SCIM
-			// turned off, because a disabled SCIM records no failures.
-			if (saved.enabled && !saved.wasEnabled) await this.resetAuthFailure();
-			// `/rest/module-settings` serves a cached snapshot, so refresh it or
-			// clients keep reading the previous value.
-			await this.moduleRegistry.refreshModuleSettings('scim');
-
-			return res.status(200).json({ data: { enabled: saved.enabled } });
+			return res.status(200).json({
+				data: {
+					enabled: enabled ?? (await this.scimSettingsService.isEnabled()),
+					...policy,
+				} satisfies ScimConfigPatchResponse,
+			});
 		} catch (error) {
-			if (error instanceof ScimSsoRequiredError) {
+			if (
+				error instanceof ScimInvalidTransferTargetError ||
+				error instanceof ScimSsoRequiredError
+			) {
 				return res.status(400).json({ message: error.message });
 			}
 
@@ -178,6 +191,28 @@ export class ScimTokenController {
 			this.logger.error('Error deleting SCIM token', { error });
 			return res.status(500).json({ message: 'Internal server error' });
 		}
+	}
+
+	private async setEnabled(enabled: boolean) {
+		const saved = await this.scimSettingsService.update({
+			enabled,
+			// Single sign-on can turn off after the check above, also on another
+			// main. The SSO-off cascade takes the lock that this check runs
+			// under, and this check reads the saved method. Thus this check
+			// sees single sign-on off, or the cascade sees this enable.
+			assertCanEnable: async (ctx) => {
+				if (!(await this.scimSsoService.isSsoEnabledInTransaction(ctx))) {
+					throw new ScimSsoRequiredError();
+				}
+			},
+		});
+
+		// A failure that is stored when SCIM turns on is from before SCIM
+		// turned off, because a disabled SCIM records no failures.
+		if (saved.enabled && !saved.wasEnabled) await this.resetAuthFailure();
+		// `/rest/module-settings` serves a cached snapshot, so refresh it or
+		// clients keep reading the previous value.
+		await this.moduleRegistry.refreshModuleSettings('scim');
 	}
 
 	/** SCIM users can sign in only through the identity provider. */
