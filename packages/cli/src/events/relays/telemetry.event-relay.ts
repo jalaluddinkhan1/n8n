@@ -2251,7 +2251,8 @@ export class TelemetryEventRelay extends EventRelay {
 		migrationUserId,
 	}: RelayEventMap['user-deleted']) {
 		this.telemetry.track('User deleted user', {
-			// A system deletion has no acting user, so the event names the system.
+			// A system deletion, for example by SCIM, has no acting user. The
+			// event then goes to the instance, and `source` names the system.
 			user_id: user?.id,
 			...(source && { source }),
 			public_api: publicApi,
