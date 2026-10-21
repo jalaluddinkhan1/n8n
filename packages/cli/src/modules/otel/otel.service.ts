@@ -28,16 +28,43 @@ import { exportOutsideSentryTracing, mergeResourceAttributes } from './otel-span
 
 import { N8N_VERSION } from '@/constants';
 import { OtelSdk } from '@/observability/otel-sdk';
-import { TRACING_OFF, type TracingPipeline } from '@/observability/swappable-pipeline';
+import {
+	TRACING_OFF,
+	type ShutdownErrors,
+	type TracingPipeline,
+} from '@/observability/swappable-pipeline';
 
 export type OtelTestTraceResult = { success: true } | { success: false; error: string };
+
+type ActiveExport = { settings: OtelConfig; spanProcessors: SpanProcessor[] };
+
+type ExportField = Exclude<keyof OtelConnectionParams, 'startupConnectivityTimeoutMs'>;
+
+const EXPORT_FIELDS: ExportField[] = [
+	'exporterProtocol',
+	'exporterEndpoint',
+	'exporterTracingPath',
+	'exporterHeaders',
+	'exporterServiceName',
+];
+
+const hasSameExportFields = (a: OtelConfig, b: OtelConfig) =>
+	EXPORT_FIELDS.every((field) => a[field] === b[field]);
 
 const stripEmptyResolutionNote = (message: string) =>
 	message.replace(/\s*Resolution note:\s*$/, '');
 
 @Service()
 export class OtelService {
-	private appliedSettings?: OtelConfig;
+	private activeExport?: ActiveExport;
+
+	private applyQueue: Promise<void> = Promise.resolve();
+
+	private queuedApply: Promise<void> | null = null;
+
+	private readonly pendingFlushes = new Set<Promise<void>>();
+
+	private isShutDown = false;
 
 	constructor(
 		private readonly otelSettingsService: OtelSettingsService,
@@ -52,14 +79,17 @@ export class OtelService {
 	}
 
 	async applySavedSettings(): Promise<void> {
-		const settings = await this.otelSettingsService.loadSettings();
-		this.appliedSettings = settings;
-		if (!this.otelSdk.isRunning) return;
+		this.queuedApply ??= this.applyQueue.then(async () => {
+			this.queuedApply = null;
+			if (this.isShutDown) return;
 
-		const pipeline = settings.enabled ? await this.buildExportPipeline(settings) : undefined;
-		await this.applyPipeline(pipeline ?? TRACING_OFF);
+			await this.applySettings(await this.otelSettingsService.loadSettings());
+		});
 
-		if (pipeline) void this.checkEndpointReachability(settings);
+		const queuedApply = this.queuedApply;
+		this.applyQueue = queuedApply.catch(() => {});
+
+		await queuedApply;
 	}
 
 	getTracer(name: string): Tracer {
@@ -120,12 +150,61 @@ export class OtelService {
 	}
 
 	async shutdown(): Promise<void> {
-		this.appliedSettings = undefined;
-		await this.applyPipeline(TRACING_OFF);
+		this.isShutDown = true;
+		await this.applyQueue;
+		this.activeExport = undefined;
+		this.applyPipeline(TRACING_OFF);
+		await Promise.all(this.pendingFlushes);
 	}
 
-	private async applyPipeline(pipeline: TracingPipeline): Promise<void> {
-		const shutdownErrors = await this.otelSdk.apply(pipeline);
+	private async applySettings(settings: OtelConfig): Promise<void> {
+		if (!this.otelSdk.isRunning) return;
+
+		const previousExport = this.activeExport;
+		const activeExport = await this.exportFor(settings);
+		this.applyPipeline(this.pipelineFor(activeExport, settings));
+		this.activeExport = activeExport;
+
+		if (activeExport && activeExport !== previousExport) {
+			void this.checkEndpointReachability(activeExport);
+		}
+	}
+
+	private async exportFor(settings: OtelConfig): Promise<ActiveExport | undefined> {
+		if (!settings.enabled) return undefined;
+		if (this.activeExport && hasSameExportFields(this.activeExport.settings, settings)) {
+			return this.activeExport;
+		}
+
+		return await this.buildExport(settings);
+	}
+
+	private pipelineFor(
+		activeExport: ActiveExport | undefined,
+		settings: OtelConfig,
+	): TracingPipeline {
+		if (!activeExport) return TRACING_OFF;
+
+		return {
+			spanProcessors: activeExport.spanProcessors,
+			sampler: new TraceIdRatioBasedSampler(settings.tracesSampleRate),
+			propagator: settings.injectOutbound
+				? new W3CTraceContextPropagator()
+				: TRACING_OFF.propagator,
+		};
+	}
+
+	private applyPipeline(pipeline: TracingPipeline): void {
+		const flush = this.otelSdk
+			.apply(pipeline)
+			.catch((error: unknown) => [error])
+			.then((shutdownErrors) => this.warnOnFailedShutdown(shutdownErrors))
+			.finally(() => this.pendingFlushes.delete(flush));
+
+		this.pendingFlushes.add(flush);
+	}
+
+	private warnOnFailedShutdown(shutdownErrors: ShutdownErrors): void {
 		if (shutdownErrors.length === 0) return;
 
 		const [error] = shutdownErrors;
@@ -135,21 +214,18 @@ export class OtelService {
 		);
 	}
 
-	private async buildExportPipeline(settings: OtelConfig): Promise<TracingPipeline | undefined> {
+	private async buildExport(settings: OtelConfig): Promise<ActiveExport | undefined> {
 		try {
 			const exporter = mergeResourceAttributes(
 				await this.createTraceExporter(settings),
 				this.resourceAttributes(settings.exporterServiceName),
 			);
 			return {
+				settings,
 				spanProcessors: [
 					new ExecutionIdentitySpanProcessor(),
 					new BatchSpanProcessor(exportOutsideSentryTracing(exporter)),
 				],
-				sampler: new TraceIdRatioBasedSampler(settings.tracesSampleRate),
-				propagator: settings.injectOutbound
-					? new W3CTraceContextPropagator()
-					: TRACING_OFF.propagator,
 			};
 		} catch (error) {
 			this.logger.error('Failed to start OpenTelemetry tracing, so tracing stays off', {
@@ -228,9 +304,9 @@ export class OtelService {
 		for (const [key, value] of Object.entries(headers)) {
 			try {
 				metadata.set(key.toLowerCase(), value);
-			} catch (error) {
+			} catch {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${key}": ${error instanceof Error ? error.message : String(error)}.`,
+					`Skipping invalid OTEL exporter header "${key}": gRPC metadata does not accept this key or its value.`,
 				);
 			}
 		}
@@ -239,13 +315,13 @@ export class OtelService {
 
 	parseOtlpHeaders(headersToSplit: string): Record<string, string> {
 		const headers: Record<string, string> = {};
-		for (const pair of headersToSplit.split(',')) {
+		for (const [index, pair] of headersToSplit.split(',').entries()) {
 			const trimmedPair = pair.trim();
 			if (!trimmedPair) continue;
 
 			if (!trimmedPair.includes('=')) {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${trimmedPair}": missing "=" separator. Expected format: "key=value".`,
+					`Skipping invalid OTEL exporter header entry ${index + 1}: missing "=" separator. Expected format: "key=value".`,
 				);
 				continue;
 			}
@@ -254,7 +330,7 @@ export class OtelService {
 			const trimmedKey = key.trim();
 			if (!trimmedKey) {
 				this.logger.warn(
-					`Skipping invalid OTEL exporter header "${trimmedPair}": empty key. Expected format: "key=value".`,
+					`Skipping invalid OTEL exporter header entry ${index + 1}: empty key. Expected format: "key=value".`,
 				);
 				continue;
 			}
@@ -269,7 +345,8 @@ export class OtelService {
 		return `${exporterEndpointWithoutTrailingSlash}${path}`;
 	}
 
-	private async checkEndpointReachability(settings: OtelConfig): Promise<void> {
+	private async checkEndpointReachability(activeExport: ActiveExport): Promise<void> {
+		const { settings } = activeExport;
 		const url = this.resolveExporterUrl(settings);
 		const timeoutMs = settings.startupConnectivityTimeoutMs;
 
@@ -280,7 +357,7 @@ export class OtelService {
 				await this.probeHttpEndpoint(url, timeoutMs);
 			}
 		} catch (error) {
-			if (this.appliedSettings !== settings) return;
+			if (this.activeExport !== activeExport) return;
 
 			this.logger.error('Failed to connect to OpenTelemetry OTLP endpoint during startup', {
 				endpoint: url,
