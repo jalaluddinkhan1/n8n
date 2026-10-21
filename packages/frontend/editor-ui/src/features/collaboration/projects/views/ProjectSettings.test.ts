@@ -11,7 +11,7 @@ import {
 } from '@/__tests__/utils';
 import ProjectSettings from './ProjectSettings.vue';
 import { useProjectsStore } from '../projects.store';
-import { VIEWS } from '@/app/constants';
+import { MODAL_CANCEL, MODAL_CLOSE, MODAL_CONFIRM, VIEWS } from '@/app/constants';
 import type { Project } from '../projects.types';
 import { ProjectTypes } from '../projects.types';
 import { createProjectListItem } from '../__tests__/utils';
@@ -42,6 +42,16 @@ vi.mock('@n8n/composables/useToast', () => ({
 	useToast: () => ({
 		showMessage: mockShowMessage,
 		showError: mockShowError,
+	}),
+}));
+
+const mockConfirm = vi.fn();
+vi.mock('@/app/composables/useMessage', () => ({
+	useMessage: () => ({
+		confirm: mockConfirm,
+		alert: vi.fn(),
+		prompt: vi.fn(),
+		message: vi.fn(),
 	}),
 }));
 
@@ -168,6 +178,8 @@ describe('ProjectSettings', () => {
 		mockShowError.mockClear();
 		mockRouterPush.mockClear();
 		routeLeaveGuard = undefined;
+		mockConfirm.mockReset();
+		mockConfirm.mockResolvedValue(MODAL_CLOSE);
 
 		mockShowMessage.mockReturnValue({ id: 'test', close: vi.fn() });
 		createTestingPinia();
@@ -828,13 +840,57 @@ describe('ProjectSettings', () => {
 
 			expect(routeLeaveGuard).toBeTypeOf('function');
 
+			// The user dismisses the dialog, so the navigation must be blocked
+			mockConfirm.mockResolvedValue(MODAL_CLOSE);
 			const next = vi.fn();
-			void routeLeaveGuard?.({ name: VIEWS.HOMEPAGE }, { name: VIEWS.PROJECT_SETTINGS }, next);
+			await routeLeaveGuard?.({ name: VIEWS.HOMEPAGE }, { name: VIEWS.PROJECT_SETTINGS }, next);
+
+			expect(mockConfirm).toHaveBeenCalledTimes(1);
+			expect(next).toHaveBeenCalledTimes(1);
+			expect(next).toHaveBeenCalledWith(false);
+		});
+
+		it('leaves without saving when the user discards the changes', async () => {
+			const { getByTestId } = renderComponent();
+			await nextTick();
+			await editNameDescriptionAndIcon(getByTestId);
+
+			mockConfirm.mockResolvedValue(MODAL_CANCEL);
+			const next = vi.fn();
+			await routeLeaveGuard?.({ name: VIEWS.HOMEPAGE }, { name: VIEWS.PROJECT_SETTINGS }, next);
+
+			expect(next).toHaveBeenCalledTimes(1);
+			expect(next).toHaveBeenCalledWith();
+			expect(projectsStore.updateProject).toHaveBeenCalledTimes(1);
+		});
+
+		it('saves and then leaves when the user confirms', async () => {
+			const { getByTestId } = renderComponent();
+			await nextTick();
+			await editNameDescriptionAndIcon(getByTestId);
+
+			mockConfirm.mockResolvedValue(MODAL_CONFIRM);
+			const next = vi.fn();
+			await routeLeaveGuard?.({ name: VIEWS.HOMEPAGE }, { name: VIEWS.PROJECT_SETTINGS }, next);
+
+			expect(projectsStore.updateProject).toHaveBeenCalledTimes(2);
+			expect(projectsStore.updateProject).toHaveBeenLastCalledWith(
+				'123',
+				expect.objectContaining({ description: 'Typed description' }),
+			);
+			expect(next).toHaveBeenCalledTimes(1);
+			expect(next).toHaveBeenCalledWith(true);
+		});
+
+		it('does not ask when there are no unsaved changes', async () => {
+			renderComponent();
 			await nextTick();
 
-			// The user must be asked first, so the navigation must not go through right away
-			expect(next).not.toHaveBeenCalledWith();
-			expect(next).not.toHaveBeenCalledWith(true);
+			const next = vi.fn();
+			await routeLeaveGuard?.({ name: VIEWS.HOMEPAGE }, { name: VIEWS.PROJECT_SETTINGS }, next);
+
+			expect(mockConfirm).not.toHaveBeenCalled();
+			expect(next).toHaveBeenCalledWith();
 		});
 
 		it('warns before the browser tab closes when name and description are not saved', async () => {
