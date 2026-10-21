@@ -1,4 +1,5 @@
 import { Logger } from '@n8n/backend-common';
+import { EventService } from '@n8n/backend-services';
 import { type WorkflowEntity, WorkflowRepository } from '@n8n/db';
 import { OnShutdown } from '@n8n/decorators';
 import { Container, Service } from '@n8n/di';
@@ -74,6 +75,9 @@ interface StopTarget {
 	/** Running executions of the tree, the root first. */
 	memberIds: string[];
 	estimatedBytes: number;
+	/** The estimate of the member with the most run data. */
+	largestEstimate: RunDataEstimate | undefined;
+	largestWorkflow: IWorkflowBase;
 }
 
 /**
@@ -123,6 +127,7 @@ export class MemoryGuardService {
 		private readonly concurrencyControl: ConcurrencyControlService,
 		private readonly tracker: RunDataTracker,
 		private readonly stoppedExecutions: StoppedExecutions,
+		private readonly eventService: EventService,
 		private readonly workflowRepository: WorkflowRepository,
 		private readonly executionRecoveryService: ExecutionRecoveryService,
 		private readonly mailer: UserManagementMailer,
@@ -262,6 +267,10 @@ export class MemoryGuardService {
 		this.logger.warn(
 			`Memory at ${formatBytes(usage.usedBytes)} of ${formatBytes(usage.limitBytes)}, holding new production executions`,
 		);
+		this.eventService.emit('memory-guard-hold-started', {
+			memoryUsedBytes: usage.usedBytes,
+			memoryLimitBytes: usage.limitBytes,
+		});
 	}
 
 	private endHold() {
@@ -271,6 +280,7 @@ export class MemoryGuardService {
 		this.holdStartedAt = undefined;
 		this.concurrencyControl.endProductionHold();
 		this.logger.info(`Memory recovered after ${heldMs}ms, letting held executions start`);
+		this.eventService.emit('memory-guard-hold-ended', { heldMs });
 	}
 
 	/** Stop the execution tree that holds the most run data. Returns whether it stopped one. */
@@ -331,7 +341,7 @@ export class MemoryGuardService {
 
 		const freedMemory =
 			after.utilization < HOLD_LEVEL || before.utilization - after.utilization >= FREED_DROP;
-		if (freedMemory) await this.countStop(target);
+		const workflowDeactivated = freedMemory ? await this.countStop(target) : false;
 
 		this.logger.warn(
 			`Stopped execution ${target.rootId} of workflow ${target.workflow.id} at ${formatBytes(before.usedBytes)} of ${formatBytes(before.limitBytes)} (${trigger}). It held an estimated ${formatBytes(target.estimatedBytes)} of run data. Memory after the stop: ${formatBytes(after.usedBytes)}`,
@@ -345,6 +355,21 @@ export class MemoryGuardService {
 				'The stop freed no memory, so the memory guard stops acting until memory falls',
 			);
 		}
+
+		const { largestEstimate, largestWorkflow } = target;
+		this.eventService.emit('memory-guard-execution-stopped', {
+			executionId: target.rootId,
+			workflowId: target.workflow.id,
+			mode: target.mode,
+			trigger,
+			runningNodeType: nodeType(largestWorkflow, largestEstimate?.runningNode),
+			largestDataNodeType: nodeType(largestWorkflow, largestNode(largestEstimate)?.name),
+			estimatedBytes: target.estimatedBytes,
+			memoryUsedBytes: before.usedBytes,
+			memoryLimitBytes: before.limitBytes,
+			freedMemory,
+			workflowDeactivated,
+		});
 	}
 
 	/**
@@ -369,8 +394,14 @@ export class MemoryGuardService {
 		let target: StopTarget | undefined;
 		for (const [rootId, members] of trees) {
 			let estimatedBytes = 0;
+			let largest: { executionId: string; estimate: RunDataEstimate } | undefined;
 			for (const { executionId } of members) {
-				estimatedBytes += this.tracker.getEstimate(executionId)?.totalBytes ?? 0;
+				const estimate = this.tracker.getEstimate(executionId);
+				if (!estimate) continue;
+				estimatedBytes += estimate.totalBytes;
+				if (!largest || estimate.totalBytes > largest.estimate.totalBytes) {
+					largest = { executionId, estimate };
+				}
 			}
 			if (estimatedBytes === 0 || (target && estimatedBytes <= target.estimatedBytes)) continue;
 
@@ -381,6 +412,9 @@ export class MemoryGuardService {
 				mode: root.executionMode,
 				memberIds: members.sort((a, b) => a.depth - b.depth).map((m) => m.executionId),
 				estimatedBytes,
+				largestEstimate: largest?.estimate,
+				largestWorkflow: this.activeExecutions.getExecutionOrFail(largest?.executionId ?? rootId)
+					.executionData.workflowData,
 			};
 		}
 
@@ -507,6 +541,10 @@ function largestNode(estimate: RunDataEstimate | undefined) {
 		if (!largest || bytes > largest.bytes) largest = { name, bytes };
 	}
 	return largest;
+}
+
+function nodeType(workflow: IWorkflowBase, nodeName: string | undefined) {
+	return workflow.nodes.find((n) => n.name === nodeName)?.type;
 }
 
 async function settleWithin(promises: Array<Promise<void>>, timeoutMs: number) {
