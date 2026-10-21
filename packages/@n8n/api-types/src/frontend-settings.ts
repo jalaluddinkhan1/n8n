@@ -386,6 +386,8 @@ export type FrontendModuleSettings = {
 	scim?: {
 		/** Whether SCIM provisioning is enabled in the instance. */
 		scimEnabled: boolean;
+		/** Whether the instance has a SCIM token. */
+		hasToken: boolean;
 	};
 
 	/**
