@@ -8,7 +8,11 @@ import { mock } from 'vitest-mock-extended';
 
 import { PostHogClient } from '@/posthog';
 
-import { SCIM_OPT_IN_REFRESH_INTERVAL_MS, ScimOptInService } from '../scim-opt-in.service';
+import {
+	SCIM_OPT_IN_REFRESH_INTERVAL_MS,
+	SCIM_OPT_IN_REFRESH_MARGIN_MS,
+	ScimOptInService,
+} from '../scim-opt-in.service';
 import type { ScimConfig } from '../scim.config';
 
 describe('ScimOptInService', () => {
@@ -174,6 +178,16 @@ describe('ScimOptInService', () => {
 	});
 
 	describe('settings refresh', () => {
+		const INTERVAL = SCIM_OPT_IN_REFRESH_INTERVAL_MS;
+		const MARGIN = SCIM_OPT_IN_REFRESH_MARGIN_MS;
+
+		/** The module settings read the opt-in through `evaluate`, as in production. */
+		const snapshotEvaluates = () =>
+			moduleRegistry.refreshModuleSettings.mockImplementation(async () => {
+				await service.evaluate();
+				return null;
+			});
+
 		beforeEach(() => {
 			vi.useFakeTimers();
 		});
@@ -183,34 +197,70 @@ describe('ScimOptInService', () => {
 			vi.useRealTimers();
 		});
 
-		it('makes the module settings again at the flag cache interval', async () => {
+		it('makes the module settings again after one interval', async () => {
 			moduleRegistry.refreshModuleSettings.mockResolvedValue(null);
 
 			service.startSettingsRefresh();
-			await vi.advanceTimersByTimeAsync(SCIM_OPT_IN_REFRESH_INTERVAL_MS);
+			await vi.advanceTimersByTimeAsync(INTERVAL + MARGIN);
 
 			expect(moduleRegistry.refreshModuleSettings).toHaveBeenCalledWith('scim');
 		});
 
-		it('evaluates the flag again for each refresh', async () => {
-			moduleRegistry.refreshModuleSettings.mockImplementation(async () => {
-				await service.evaluate();
-				return null;
-			});
+		it('does not clear a flag result before it expires', async () => {
+			snapshotEvaluates();
 			service.startSettingsRefresh();
-			// The cached result is still fresh when the refresh runs.
-			await vi.advanceTimersByTimeAsync(SCIM_OPT_IN_REFRESH_INTERVAL_MS / 2);
+			await vi.advanceTimersByTimeAsync(INTERVAL / 2);
 			await service.evaluate();
-			await vi.advanceTimersByTimeAsync(SCIM_OPT_IN_REFRESH_INTERVAL_MS / 2);
 
+			// The first refresh runs while the result is still fresh.
+			await vi.advanceTimersByTimeAsync(INTERVAL / 2 + MARGIN);
+			expect(moduleRegistry.refreshModuleSettings).toHaveBeenCalledTimes(1);
+			expect(postHogClient.getFeatureFlagForInstance).toHaveBeenCalledTimes(1);
+
+			// The next refresh runs after the result expires.
+			await vi.advanceTimersByTimeAsync(INTERVAL / 2);
+			expect(moduleRegistry.refreshModuleSettings).toHaveBeenCalledTimes(2);
 			expect(postHogClient.getFeatureFlagForInstance).toHaveBeenCalledTimes(2);
+		});
+
+		// PostHogClient caches the flag for the same interval. A refresh that
+		// cleared a fresh result got the old PostHog value and kept it for one
+		// more interval.
+		it('shows a flag change within one interval, although PostHog caches the flag too', async () => {
+			let flagInPostHog = false;
+			let postHogCache: { value: boolean; expiresAt: number } | undefined;
+			postHogClient.getFeatureFlagForInstance.mockImplementation(async () => {
+				if (!postHogCache || postHogCache.expiresAt <= Date.now()) {
+					postHogCache = { value: flagInPostHog, expiresAt: Date.now() + INTERVAL };
+				}
+				return postHogCache.value;
+			});
+			snapshotEvaluates();
+			service.startSettingsRefresh();
+			await vi.advanceTimersByTimeAsync(INTERVAL / 2);
+			await expect(service.evaluate()).resolves.toEqual({ available: false, source: null });
+
+			flagInPostHog = true;
+			await vi.advanceTimersByTimeAsync(INTERVAL + MARGIN);
+
+			await expect(service.evaluate()).resolves.toEqual({ available: true, source: 'flag' });
+			expect(moduleRegistry.refreshModuleSettings).toHaveBeenCalledTimes(2);
+		});
+
+		it('keeps the schedule when a refresh fails', async () => {
+			moduleRegistry.refreshModuleSettings.mockRejectedValue(new Error('db down'));
+
+			service.startSettingsRefresh();
+			await vi.advanceTimersByTimeAsync(2 * (INTERVAL + MARGIN));
+
+			expect(moduleRegistry.refreshModuleSettings).toHaveBeenCalledTimes(2);
 		});
 
 		it('does not refresh while the config switch is on', async () => {
 			scimConfig.optIn = true;
 
 			service.startSettingsRefresh();
-			await vi.advanceTimersByTimeAsync(SCIM_OPT_IN_REFRESH_INTERVAL_MS);
+			await vi.advanceTimersByTimeAsync(INTERVAL + MARGIN);
 
 			expect(moduleRegistry.refreshModuleSettings).not.toHaveBeenCalled();
 		});
@@ -218,7 +268,7 @@ describe('ScimOptInService', () => {
 		it('stops on shutdown', async () => {
 			service.startSettingsRefresh();
 			service.stopSettingsRefresh();
-			await vi.advanceTimersByTimeAsync(SCIM_OPT_IN_REFRESH_INTERVAL_MS);
+			await vi.advanceTimersByTimeAsync(INTERVAL + MARGIN);
 
 			expect(moduleRegistry.refreshModuleSettings).not.toHaveBeenCalled();
 		});

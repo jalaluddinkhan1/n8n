@@ -14,8 +14,11 @@ export interface ScimOptIn {
 	source: ScimOptInSource | null;
 }
 
-/** Same as the PostHog flag cache, so a refresh can see each new flag value. */
+/** How long a flag result is kept. Same as the PostHog flag cache. */
 export const SCIM_OPT_IN_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+/** The settings refresh waits this long after the flag result expires. */
+export const SCIM_OPT_IN_REFRESH_MARGIN_MS = 1000;
 
 /**
  * Pre-GA opt-in for SCIM. The `feat:scim` license flag activates the module,
@@ -96,33 +99,60 @@ export class ScimOptInService {
 	/**
 	 * `/rest/module-settings` serves a snapshot that the module makes at
 	 * startup. The PostHog flag can change at any time, so make the snapshot
-	 * again at the flag cache interval. The refresh evaluates the flag again,
-	 * so the routes and the snapshot use the same value. The config switch
-	 * changes only with a restart, so it needs no refresh.
+	 * again each time the flag result expires. The snapshot reads the flag
+	 * through `evaluate`, so the routes and the snapshot use the same value.
+	 * The config switch changes only with a restart, so it needs no refresh.
 	 */
 	startSettingsRefresh() {
 		if (this.scimConfig.optIn || this.refreshTimer) return;
 
-		this.refreshTimer = setInterval(() => {
-			void this.refreshSettings();
-		}, SCIM_OPT_IN_REFRESH_INTERVAL_MS);
-		// The refresh must not keep the process alive.
-		this.refreshTimer.unref();
+		this.scheduleSettingsRefresh();
 	}
 
 	/** Evaluates the flag again and makes the module settings again with the new value. */
 	async refreshSettings() {
 		this.flagResult = undefined;
+		await this.refreshModuleSettings();
+	}
+
+	@OnShutdown()
+	stopSettingsRefresh() {
+		clearTimeout(this.refreshTimer);
+		this.refreshTimer = undefined;
+	}
+
+	/**
+	 * The scheduled refresh runs after the flag result expires, and it does
+	 * not clear a result that has not expired. `PostHogClient` caches the
+	 * flag too, and its entry never expires after the result that it gave.
+	 * Thus each new evaluation gets a new PostHog value, not a cached one
+	 * that is almost one interval old.
+	 */
+	private scheduleSettingsRefresh() {
+		const now = Date.now();
+		const expiresAt =
+			this.flagResult && this.flagResult.expiresAt > now
+				? this.flagResult.expiresAt
+				: now + SCIM_OPT_IN_REFRESH_INTERVAL_MS;
+
+		this.refreshTimer = setTimeout(
+			() => {
+				void this.refreshModuleSettings().then(() => {
+					// No new timer after shutdown.
+					if (this.refreshTimer) this.scheduleSettingsRefresh();
+				});
+			},
+			expiresAt - now + SCIM_OPT_IN_REFRESH_MARGIN_MS,
+		);
+		// The refresh must not keep the process alive.
+		this.refreshTimer.unref();
+	}
+
+	private async refreshModuleSettings() {
 		try {
 			await this.moduleRegistry.refreshModuleSettings('scim');
 		} catch (error) {
 			this.logger.warn('SCIM: Failed to refresh the module settings', { error });
 		}
-	}
-
-	@OnShutdown()
-	stopSettingsRefresh() {
-		clearInterval(this.refreshTimer);
-		this.refreshTimer = undefined;
 	}
 }
