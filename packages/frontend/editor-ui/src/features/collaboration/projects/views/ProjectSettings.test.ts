@@ -876,7 +876,10 @@ describe('ProjectSettings', () => {
 			expect(projectsStore.updateProject).toHaveBeenCalledTimes(2);
 			expect(projectsStore.updateProject).toHaveBeenLastCalledWith(
 				'123',
-				expect.objectContaining({ description: 'Typed description' }),
+				expect.objectContaining({
+					name: 'Test Project Renamed',
+					description: 'Typed description',
+				}),
 			);
 			expect(next).toHaveBeenCalledTimes(1);
 			expect(next).toHaveBeenCalledWith(true);
