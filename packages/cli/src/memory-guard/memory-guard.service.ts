@@ -1,15 +1,20 @@
 import { Logger } from '@n8n/backend-common';
+import { WorkflowRepository } from '@n8n/db';
 import { OnShutdown } from '@n8n/decorators';
-import { Service } from '@n8n/di';
+import { Container, Service } from '@n8n/di';
 import { ensureError } from '@n8n/utils/errors/ensure-error';
 import { formatBytes } from '@n8n/utils/number/bytes';
-import type { IWorkflowBase } from 'n8n-workflow';
+import type { IWorkflowBase, WorkflowExecuteMode } from 'n8n-workflow';
 import { MemoryPressureExecutionCancelledError, WorkflowOperationError } from 'n8n-workflow';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 
 import { ActiveExecutions } from '@/active-executions';
 import { ConcurrencyControlService } from '@/concurrency/concurrency-control.service';
+import { ExecutionRecoveryService } from '@/executions/execution-recovery.service';
+import { UserManagementMailer } from '@/user-management/email/user-management-mailer';
+import { isWorkflowIdValid } from '@/utils';
+import { WorkflowPushNotifier } from '@/workflows/workflow-push-notifier.service';
 
 import { getContainerLimit, type MemoryUsage, readMemoryUsage } from './memory-usage';
 import { type RunDataEstimate, RunDataTracker } from './run-data-tracker';
@@ -52,6 +57,11 @@ const RELEASE_TIMEOUT_MS = 5_000;
 /** Drop in utilization that counts as freeing memory, when a stop does not end the hold. */
 const FREED_DROP = 0.05;
 
+/** Stops that freed memory before the guard deactivates the workflow. */
+const STOPS_TO_DEACTIVATE = 3;
+
+const PRODUCTION_MODES: WorkflowExecuteMode[] = ['webhook', 'trigger', 'chat'];
+
 const MEMORY_DOCS_URL =
 	'https://docs.n8n.io/deploy/host-n8n/configure-n8n/scaling/fix-memory-issues';
 
@@ -60,6 +70,7 @@ type StopTrigger = 'threshold' | 'critical' | 'hold-limit';
 interface StopTarget {
 	rootId: string;
 	workflow: IWorkflowBase;
+	mode: WorkflowExecuteMode;
 	/** Running executions of the tree, the root first. */
 	memberIds: string[];
 	estimatedBytes: number;
@@ -104,12 +115,18 @@ export class MemoryGuardService {
 	/** Set when nothing can be stopped to end a hold, until memory falls below the resume level. */
 	private isHoldSuspended = false;
 
+	private readonly stopsByWorkflow = new Map<string, number>();
+
 	constructor(
 		private readonly logger: Logger,
 		private readonly activeExecutions: ActiveExecutions,
 		private readonly concurrencyControl: ConcurrencyControlService,
 		private readonly tracker: RunDataTracker,
 		private readonly stoppedExecutions: StoppedExecutions,
+		private readonly workflowRepository: WorkflowRepository,
+		private readonly executionRecoveryService: ExecutionRecoveryService,
+		private readonly mailer: UserManagementMailer,
+		private readonly workflowPushNotifier: WorkflowPushNotifier,
 	) {
 		this.logger = this.logger.scoped('memory-guard');
 	}
@@ -314,6 +331,7 @@ export class MemoryGuardService {
 
 		const freedMemory =
 			after.utilization < HOLD_LEVEL || before.utilization - after.utilization >= FREED_DROP;
+		if (freedMemory) await this.countStop(target);
 
 		this.logger.warn(
 			`Stopped execution ${target.rootId} of workflow ${target.workflow.id} at ${formatBytes(before.usedBytes)} of ${formatBytes(before.limitBytes)} (${trigger}). It held an estimated ${formatBytes(target.estimatedBytes)} of run data. Memory after the stop: ${formatBytes(after.usedBytes)}`,
@@ -356,9 +374,11 @@ export class MemoryGuardService {
 			}
 			if (estimatedBytes === 0 || (target && estimatedBytes <= target.estimatedBytes)) continue;
 
+			const root = this.activeExecutions.getExecutionOrFail(rootId).executionData;
 			target = {
 				rootId,
-				workflow: this.activeExecutions.getExecutionOrFail(rootId).executionData.workflowData,
+				workflow: root.workflowData,
+				mode: root.executionMode,
 				memberIds: members.sort((a, b) => a.depth - b.depth).map((m) => m.executionId),
 				estimatedBytes,
 			};
@@ -381,6 +401,63 @@ export class MemoryGuardService {
 			depth++;
 		}
 		return { rootId, depth };
+	}
+
+	/** Count a stop that freed memory. Returns whether the workflow was deactivated. */
+	private async countStop({ workflow, mode }: StopTarget) {
+		// A test run uses the draft, so it says nothing about the published version.
+		if (!PRODUCTION_MODES.includes(mode) || !isWorkflowIdValid(workflow.id)) return false;
+
+		const stops = (this.stopsByWorkflow.get(workflow.id) ?? 0) + 1;
+		if (stops < STOPS_TO_DEACTIVATE) {
+			this.stopsByWorkflow.set(workflow.id, stops);
+			return false;
+		}
+
+		this.stopsByWorkflow.delete(workflow.id);
+		return await this.deactivate(workflow.id);
+	}
+
+	private async deactivate(workflowId: string) {
+		const workflow = await this.workflowRepository.findOne({ where: { id: workflowId } });
+		if (!workflow || workflow.activeVersionId === null) return false;
+
+		try {
+			// Lazy import, like crash recovery, because the workflow service depends on much
+			const { WorkflowService } = await import('@/workflows/workflow.service.js');
+			await Container.get(WorkflowService).deactivateWorkflowAsSystem(workflowId);
+		} catch (error) {
+			this.logger.error(`Failed to deactivate workflow ${workflowId}`, {
+				workflowId,
+				error: ensureError(error),
+			});
+			return false;
+		}
+
+		this.logger.warn(
+			`Deactivated workflow ${workflowId}, because n8n stopped ${STOPS_TO_DEACTIVATE} of its executions to keep the instance from running out of memory`,
+			{ workflowId },
+		);
+
+		try {
+			const recipient = await this.executionRecoveryService.getAutodeactivationRecipient(workflow);
+			await this.mailer.notifyWorkflowAutodeactivated({
+				recipient,
+				workflow,
+				reason: 'memory-pressure',
+			});
+			await this.workflowPushNotifier.notify(workflowId, {
+				type: 'workflowAutoDeactivated',
+				data: { workflowId },
+			});
+		} catch (error) {
+			this.logger.error(`Failed to notify about the deactivation of workflow ${workflowId}`, {
+				workflowId,
+				error: ensureError(error),
+			});
+		}
+
+		return true;
 	}
 }
 
